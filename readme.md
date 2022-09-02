@@ -25,8 +25,8 @@ const run = {
   `,
   // Upload or backup, support batch processing
   upload: [
-    [`${projectDir}/dist`, `/home/la/www/web`, `_back_YYYY-MM-DD_hh-mm-ss`],
-    [`${projectDir}/plugin`, `/home/la/www/plugin`],
+    [`${projectDir}/dist/`, `/home/la/www/web/`, `_back_YYYY-MM-DD_hh-mm-ss`],
+    [`${projectDir}/plugin/`, `/home/la/www/plugin/`],
   ],
   // Command to run after upload, such as restoring service access
   postCmd: `
