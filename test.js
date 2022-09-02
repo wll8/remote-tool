@@ -3,7 +3,7 @@ const store = require(`userkey`)()
 const projectDir = `${__dirname}/node_modules/`
 const key = process.argv[2] || ``
 if(!key) {
-  console.log(`使用 key=a,b,c... 的形式运行任务`)
+  console.log(`使用 $0 key,key1... 的形式运行任务`)
   process.exit()
 }
 

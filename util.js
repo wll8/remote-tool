@@ -9,7 +9,7 @@ const { Client: Ssh } = require('ssh2')
  * @param {*} cmd 待执行命令
  * @returns 
  */
-async function remoteRunCmd(remoteInfo, cmd) {
+async function remoteRunCmd(remoteInfo, cmd, {log = true} = {}) {
   cmd = `${cmd}\nexit\n`
   return new Promise((resolve, reject) => {
     let outData = ``
@@ -24,7 +24,7 @@ async function remoteRunCmd(remoteInfo, cmd) {
           resolve(outData)
         }).on(`data`, (data) => {
           outData = outData + data
-          process.stdout.write(data) // 转换服务器的输出到本地显示
+          log && process.stdout.write(data) // 转换服务器的输出到本地显示
         })
         stream.end(cmd)
       })
@@ -41,20 +41,19 @@ async function remoteRunCmd(remoteInfo, cmd) {
  * @param {*} upload[0][2] 设置备份格式时进行备份, 不设置时如果是文件则覆盖, 目录则合并
  * @returns 
  */
-async function remoteUpload(remoteInfo, upload) {
+async function remoteUpload(remoteInfo, upload, opt) {
   return new Promise(async (resolve, reject) => {
     const client = await Scp(remoteInfo).catch(reject)
-    client.sshClient
     for (let index = 0; index < upload.length; index++) {
       let {from, to, toDir, backPath, fromType} = pathHelper(upload[index])
 
       // -- 如果目标目录不存在则创建它
-      ;(await client.exists(toDir)) === false && await remoteRunCmd(remoteInfo, `mkdir -p "${toDir}"`);
+      ;(await client.exists(toDir)) === false && await remoteRunCmd(remoteInfo, `mkdir -p "${toDir}"`, opt);
       
       // -- 如果有备份参数时, 备份它们
-      backPath && (await client.exists(to)) && (await remoteRunCmd(remoteInfo, `cp -a "${to}" "${backPath}"`));
+      backPath && (await client.exists(to)) && (await remoteRunCmd(remoteInfo, `cp -a "${to}" "${backPath}"`, opt));
       
-      await client[`upload${fromType}`](from, to).catch(err => console.log(`上传失败: ${from} => ${to}`, err))
+      await client[`upload${fromType}`](from, to).catch(err => console.log(`upload failed: ${from} => ${to}`, err))
     }
     resolve()
   })
@@ -70,7 +69,7 @@ function pathHelper(arr = []) {
   let backPath = undefined
 
   if(fs.existsSync(from) === false) {
-    throw new Error(`要处理的 ${from} 不存在`)
+    throw new Error(`The object to be processed does not exist: ${from}`)
   }
   const {base: fromName, ext} = require(`path`).parse(from)
   
@@ -107,11 +106,11 @@ async function remoteTool(remoteInfo, {
   preCmd = ``,
   upload = [],
   postCmd = ``,
-}) {
+}, opt) {
   return new Promise(async (resolve, reject) => {
-    const preCmdRes = preCmd && await remoteRunCmd(remoteInfo, preCmd).catch(reject)
-    const uploadRes = upload.length && await remoteUpload(remoteInfo, upload).catch(reject)
-    const postCmdRes = postCmd && await remoteRunCmd(remoteInfo, postCmd).catch(reject)
+    const preCmdRes = preCmd && await remoteRunCmd(remoteInfo, preCmd, opt).catch(reject)
+    const uploadRes = upload.length && await remoteUpload(remoteInfo, upload, opt).catch(reject)
+    const postCmdRes = postCmd && await remoteRunCmd(remoteInfo, postCmd, opt).catch(reject)
     resolve(preCmdRes, uploadRes, postCmdRes)
   })
 }
@@ -142,7 +141,61 @@ function dateFormat(fmt, date) {
   return fmt
 }
 
+/**
+ * 解析命令行参数
+ * @param {*} arr 
+ * @returns 
+ */
+function parseArgv(arr) {
+  return (arr || process.argv.slice(2)).reduce((acc, arg) => {
+    let [k, ...v] = arg.split(`=`)
+    v = v.join(`=`) // 把带有 = 的值合并为字符串
+    acc[k] = v === `` // 没有值时, 则表示为 true
+      ? true
+      : (
+        /^(true|false)$/.test(v) // 转换指明的 true/false
+        ? v === `true`
+        : (
+          /[\d|.]+/.test(v)
+          ? (isNaN(Number(v)) ? v : Number(v)) // 如果转换为数字失败, 则使用原始字符
+          : v
+        )
+      )
+    return acc
+  }, {})
+}
+
+/**
+ * 移除左边空白符
+ * @param {*} str 
+ * @returns 
+ */
+function removeLeft(str) {
+  const lines = str.split(`\n`)
+  // 获取应该删除的空白符数量
+  const minSpaceNum = lines.filter(item => item.trim())
+    .map(item => item.match(/(^\s+)?/)[0].length)
+    .sort((a, b) => a - b)[0]
+  // 删除空白符
+  const newStr = lines
+    .map(item => item.slice(minSpaceNum))
+    .join(`\n`)
+  return newStr
+}
+
+/**
+ * 获取与终端大小相同的字符串
+ * @param {string} str 要输出的字符
+ * @returns {string}
+ */
+function getFullLine(str = `=`) {
+  const size = (process.stdout.columns || 80) - 1 // 给换行符让位
+  return str.repeat(size)
+}
 
 module.exports = {
+  getFullLine,
+  removeLeft,
+  parseArgv,
   remoteTool,
 }
