@@ -16,7 +16,7 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "node-scp": "^0.0.18",
+    "node-scp": "^0.0.21",
     "ssh2": "^1.11.0",
     "userkey": "^1.0.3"
   }

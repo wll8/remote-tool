@@ -34,19 +34,19 @@ nan@^2.15.0, nan@^2.16.0:
   resolved "https://registry.npmmirror.com/nan/-/nan-2.16.0.tgz#664f43e45460fb98faf00edca0bb0d7b8dce7916"
   integrity sha512-UdAqHyFngu7TfQKsCBgAA6pWDkT8MAO7d0jyOecVhN5354xbLqdn8mV9Tat9gepAupm0bt2DbeaSC8vS52MuFA==
 
-node-scp@^0.0.18:
-  version "0.0.18"
-  resolved "https://registry.npmmirror.com/node-scp/-/node-scp-0.0.18.tgz#73dd2105563d04991f40571ee00323272fbc072f"
-  integrity sha512-PHRXMAb8Wfjtrsr6zz2UbOG+XcyDZUM/r8ZW0aUVxbuXfYex+wR0OD/jqw6TpdkvV+ddNLh+UBNV8oJ3R6Q9RA==
+node-scp@^0.0.21:
+  version "0.0.21"
+  resolved "https://registry.yarnpkg.com/node-scp/-/node-scp-0.0.21.tgz#1325166b0d266efd3ecf824614f1c7a74cc1cc3f"
+  integrity sha512-uq91uDisb/XAk+uz7yXHbJyH6/e7QnWscfQtfU86mTWwAkiWTw26AdyjvZK2962PENDUlTKdicZxdQGcEiL2vw==
   dependencies:
-    ssh2 "^1.6.0"
+    ssh2 "^1.11.0"
 
 safer-buffer@~2.1.0:
   version "2.1.2"
   resolved "https://registry.npmmirror.com/safer-buffer/-/safer-buffer-2.1.2.tgz#44fa161b0187b9549dd84bb91802f9bd8385cd6a"
   integrity sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==
 
-ssh2@^1.11.0, ssh2@^1.6.0:
+ssh2@^1.11.0:
   version "1.11.0"
   resolved "https://registry.npmmirror.com/ssh2/-/ssh2-1.11.0.tgz#ce60186216971e12f6deb553dcf82322498fe2e4"
   integrity sha512-nfg0wZWGSsfUe/IBJkXVll3PEZ//YH2guww+mP88gTpuSU4FtZN7zu9JoeTGOyCNx2dTDtT9fOpWwlzyj4uOOw==
