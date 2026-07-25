@@ -39,6 +39,19 @@ const run = {
 remoteTool(server, run)
 ```
 
+### Upload with glob patterns
+The first element of an upload entry (`src`) may also be an array — it is spread directly into [`globby(patterns, options?)`](https://github.com/sindresorhus/globby), so matched files keep their relative directory structure under the target directory. This mode does not support the backup (`_back_`) argument.
+
+```js
+upload: [
+  // src is an array => globby('dist/**/*.js', { cwd: projectDir })
+  // matched files keep relative structure: /home/la/www/web/dist/a.js, .../dist/sub/b.js
+  [[`dist/**/*.js`, { cwd: projectDir }], `/home/la/www/web/`],
+  // patterns may itself be an array (supports negation): globby(['**/*', '!**/*.map'], { cwd: projectDir })
+  [[['**/*', '!**/*.map'], { cwd: projectDir }], `/home/la/www/web/`],
+],
+```
+
 ### Use from the command line
 ``` sh
 # Install

@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "homepage": "https://github.com/wll8/remote-tool",
   "repository": {
@@ -16,8 +17,12 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "globby": "^16.2.2",
     "node-scp": "^0.0.18",
     "ssh2": "^1.11.0",
     "userkey": "^1.0.3"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
   }
 }

@@ -311,7 +311,7 @@ async function uploadFileResumable(holder, f, opt = {}) {
  * 上传文件到远程服务器
  * @param {*} remoteInfo 服务器信息
  * @param {*} upload 待上传列表
- * @param {*} upload[0][0] 待上传目录或文件绝对地址
+ * @param {*} upload[0][0] 待上传目录或文件绝对地址; 为数组时按 globby(patterns, options?) 批量匹配, 形如 [patterns, options?], 匹配文件保留相对结构放到目标目录下(此模式不支持备份)
  * @param {*} upload[0][1] 目标地址
  * @param {*} upload[0][2] 设置备份格式时进行备份, 不设置时如果是文件则覆盖, 目录则合并
  * @param {*} opt.progress 是否显示进度条, 默认 true 且仅 TTY 生效
@@ -336,31 +336,46 @@ async function remoteUpload(remoteInfo, upload, opt = {}) {
     const failed = [] // -- 累计所有 upload 项中重试耗尽仍失败的文件
 
     for (let index = 0; index < upload.length; index++) {
-      let {from, to, toDir, backPath, fromType} = pathHelper(upload[index])
-
-      // -- 如果目标目录不存在则递归创建(复用 SFTP 连接, 避免新建 SSH 连接)
-      await ensureRemoteDir(client, toDir);
-
-      // -- 如果有备份参数时, 备份它们
-      backPath && (await client.exists(to)) && (await remoteRunCmd(remoteInfo, `cp -a "${to}" "${backPath}"`, opt));
-
-      // -- 收集待上传文件列表(目录递归 / 单文件), 目录时预建远程子目录
+      const item = upload[index]
       let fileList
-      if(fromType === `Dir`) {
-        const walked = walkLocal(from, to)
-        // -- walked.dirs 已按父到子有序, 复用同一 SFTP 连接逐级创建, 避免每个子目录新建 SSH 连接
-        for (let i = 0; i < walked.dirs.length; i++) {
-          await client.mkdir(walked.dirs[i]).catch(() => {})
+      let srcLabel  // -- 当前项源描述, 用于空匹配日志
+
+      if(Array.isArray(item[0])) {
+        // -- globby 批量模式: item[0] 为 [patterns, options?], 匹配文件保留相对结构放到远程 to 下
+        //    逐个预建远程目录(含子目录); 批量模式不支持 back 备份(语义不明确)
+        const expanded = await expandGlobby(item)
+        for (let i = 0; i < expanded.dirs.length; i++) {
+          await ensureRemoteDir(client, expanded.dirs[i])
         }
-        fileList = walked.files
+        fileList = expanded.files
+        srcLabel = `globby ${JSON.stringify(item[0])}`
       } else {
-        fileList = [{from, to, size: fs.statSync(from).size}]
+        let {from, to, toDir, backPath, fromType} = pathHelper(item)
+        srcLabel = from
+
+        // -- 如果目标目录不存在则递归创建(复用 SFTP 连接, 避免新建 SSH 连接)
+        await ensureRemoteDir(client, toDir);
+
+        // -- 如果有备份参数时, 备份它们
+        backPath && (await client.exists(to)) && (await remoteRunCmd(remoteInfo, `cp -a "${to}" "${backPath}"`, opt));
+
+        // -- 收集待上传文件列表(目录递归 / 单文件), 目录时预建远程子目录
+        if(fromType === `Dir`) {
+          const walked = walkLocal(from, to)
+          // -- walked.dirs 已按父到子有序, 复用同一 SFTP 连接逐级创建, 避免每个子目录新建 SSH 连接
+          for (let i = 0; i < walked.dirs.length; i++) {
+            await client.mkdir(walked.dirs[i]).catch(() => {})
+          }
+          fileList = walked.files
+        } else {
+          fileList = [{from, to, size: fs.statSync(from).size}]
+        }
       }
 
       const totalBytes = fileList.reduce((sum, f) => sum + f.size, 0)
       // -- 空目录或无可传字节时跳过本项, 用 continue 不中断后续 upload 项
       if(fileList.length === 0 || totalBytes === 0) {
-        fileList.length === 0 && console.log(`目录为空或无文件: ${from}`)
+        fileList.length === 0 && console.log(`目录为空或无文件: ${srcLabel}`)
         continue
       }
 
@@ -520,6 +535,52 @@ function pathHelper(arr = []) {
   return obj
 }
 
+// -- globby 为纯 ESM 包, CJS 中需 dynamic import; 首次加载后缓存, 避免每项重复加载
+let _globby
+async function getGlobby() {
+  if(!_globby) _globby = (await import(`globby`)).globby
+  return _globby
+}
+
+/**
+ * 展开 globby 形式的上传源
+ * from 为数组时, spread 调用 globby(patterns, options?), 完全对应 globby 签名:
+ *   from = [patterns, options?]  =>  globby(patterns, options?)
+ * patterns 既可是单个 glob 串, 也可是字符串数组(支持取反 !), options 可选(如 cwd/ignore/expandDirectories)
+ * 匹配到的文件保留相对 cwd 的目录结构, 对应放到远程 to 目录下; 批量模式不支持 back 备份
+ * @param {Array} item upload 项: item[0] 为 [patterns, options?], item[1] 为远程目标 to
+ * @returns {Promise<{files: Array<{from:string, to:string, size:number}>, dirs: string[]}>}
+ *          files 待上传文件列表(本地绝对地址 => 远程 posix 地址), dirs 需预建的远程目录(去重)
+ */
+async function expandGlobby(item) {
+  const [globbyArgs, toRaw] = item
+  const options = (globbyArgs[1] && typeof globbyArgs[1] === `object`) ? globbyArgs[1] : {}
+  const cwd = options.cwd || process.cwd()
+  const globby = await getGlobby()
+  // -- globby(...from): 透传 patterns 与 options, 完全对应 globby(patterns, options?)
+  const matched = await globby(...globbyArgs)
+  const toBase = String(toRaw).replace(/\/+$/, ``)
+  const files = []
+  const dirs = new Set()
+  for(const rel of matched) {
+    const abs = path.resolve(cwd, rel)
+    let stat
+    try {
+      stat = fs.statSync(abs)
+    } catch(err) {
+      // -- 断链或不可读条目跳过, 不阻断整体流程, 与 walkLocal 行为一致
+      console.log(`skip: ${abs}`, err)
+      continue
+    }
+    if(!stat.isFile()) continue
+    // -- 保留 globby 相对结构(统一为 posix), 拼接到远程基目录下
+    const remotePath = `${toBase}/${rel.replace(/\\/g, `/`)}`
+    files.push({from: abs, to: remotePath, size: stat.size})
+    dirs.add(path.posix.dirname(remotePath))
+  }
+  return {files, dirs: [...dirs]}
+}
+
 /**
  * 远程服务器运行命令或上传文件
  * @param {*} remoteInfo 服务器信息
@@ -646,8 +707,10 @@ module.exports = {
   getFullLine,
   removeLeft,
   parseArgv,
+  remoteRunCmd,
   remoteTool,
   isConnectionError,
   uploadFileWithRetry,
   uploadFileResumable,
+  expandGlobby,
 }
