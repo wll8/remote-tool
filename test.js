@@ -11,17 +11,20 @@ const map = [
   {
     desc: `目录下的内容到服务器目录中`,
     key: `dirin-to-dirin`,
-    server: store.get(`127.0.0.1`),
+    server: store.get(`vps`),
     run: {
       upload: [
         [`${projectDir}/userkey/`, `/home/la/www/distfile/`],
       ],
+      // 单文件上传失败时自动重试(指数退避), 耗尽才计入失败汇总, 流程不退出
+      retry: 3,
+      retryDelay: 500,
     },
   },
   {
     desc: `整个目录到服务器目录中`,
     key: `dir-dirin`,
-    server: store.get(`127.0.0.1`),
+    server: store.get(`vps`),
     run: {
       upload: [
         [`${projectDir}/userkey`, `/home/la/www/distfile/`, `_back_YYYYMMDDhhmmss`],
@@ -31,7 +34,7 @@ const map = [
   {
     desc: `文件到服务器目录`,
     key: `file-dirin`,
-    server: store.get(`127.0.0.1`),
+    server: store.get(`vps`),
     run: {
       upload: [
         [`${projectDir}/userkey/package.json`, `/home/la/www/distfile/`, `_back_YYYYMMDDhhmmss`],
@@ -41,7 +44,7 @@ const map = [
   {
     desc: `文件到服务器文件`,
     key: `file-file`,
-    server: store.get(`127.0.0.1`),
+    server: store.get(`vps`),
     run: {
       preCmd: `
         ls -al --time-style="+%Y-%m-%d %H:%M:%S" /home/la/www/

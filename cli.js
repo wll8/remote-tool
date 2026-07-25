@@ -9,6 +9,13 @@ new Promise(async () => {
     log,
     init,
     key,
+    progress,
+    skipSame,
+    skipSameMinSize,
+    retry,
+    retryDelay,
+    resume,
+    resumeMinSize,
   } = util.parseArgv()
   const [arg1] = process.argv.slice(2)
   if([undefined, `--help`, `-h`].includes(arg1)) {
@@ -18,6 +25,13 @@ new Promise(async () => {
       `usage:`,
       `  key       --[string ] Configuration to execute, separated by commas to indicate multiple`,
       `  log       --[boolean] Whether to output the running log in the server`,
+      `  progress  --[boolean] Show upload byte progress bar (default true, auto-off in non-TTY)`,
+      `  skipSame  --[boolean] Skip files already uploaded (compare by md5), default true`,
+      `  skipSameMinSize --[number] Min file size in bytes to compare md5; smaller files upload directly (default 24576)`,
+      `  retry     --[number] Extra retries on single-file upload failure (default 3, exponential backoff; 0 = try once)`,
+      `  retryDelay--[number] Base backoff ms for retry, capped at 10000 (default 500)`,
+      `  resume    --[boolean] Resume large-file uploads from remote size on reconnect (default false)`,
+      `  resumeMinSize --[number] Min file size in bytes to use resume; smaller files use fastPut (default 52428800)`,
       ``,
       `eg:`,
       `  # Initialize the configuration file`,
@@ -60,6 +74,10 @@ new Promise(async () => {
                 ],
                 // Command to run after upload, such as restoring service access
                 postCmd: "pm2 start web",
+                // Skip files already uploaded (compare by md5), default true
+                // skipSame: false,
+                // Min file size in bytes to compare md5; smaller files upload directly (default 24KB)
+                // skipSameMinSize: 24 * 1024,
               },
             },
             {
@@ -95,7 +113,7 @@ new Promise(async () => {
       for (let index = 0; index < keyList.length; index++) {
         const key = keyList[index]
         const item = configList.find(item => item.key === key)
-        item && await remoteTool(item.server, item.run, {log}).catch(err => {
+        item && await remoteTool(item.server, item.run, {log, progress, skipSame, skipSameMinSize, retry, retryDelay, resume, resumeMinSize}).catch(err => {
           console.info(err)
         })
         item && console.info(util.getFullLine())
