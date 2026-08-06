@@ -250,7 +250,7 @@ async function isOwnBreakpoint(sftp, f, remoteSize) {
  * @param {{from:string, to:string, size:number}} f
  * @param {object} opt { step }
  */
-async function uploadFileResumableOnce(holder, f, { step, md5Conn } = {}) {
+async function uploadFileResumableOnce(holder, f, { step, md5Holder } = {}) {
   const client = holder.getClient()
   const sftp = client.sftpWrapper
   const fileSize = f.size
@@ -259,8 +259,8 @@ async function uploadFileResumableOnce(holder, f, { step, md5Conn } = {}) {
   let remoteSize = st && st.size ? st.size : 0
   if(remoteSize >= fileSize) {
     // -- 大小已满: md5 确认是否真一致(防同名同大小异内容), 不一致则重传
-    if(md5Conn) {
-      const rm = await remoteFileMd5(md5Conn, f.to)
+    if(md5Holder && md5Holder.getConn()) {
+      const {md5: rm} = await remoteFileMd5(md5Holder, f.to)
       const lm = await localMd5(f.from).catch(() => ``)
       if(rm && lm && rm !== lm) remoteSize = 0
     }
@@ -297,9 +297,9 @@ async function uploadFileResumableOnce(holder, f, { step, md5Conn } = {}) {
  * @returns {Promise<boolean>}
  */
 async function uploadFileResumable(holder, f, opt = {}) {
-  const { retry = 3, retryDelay = 500, step, md5Conn } = opt
+  const { retry = 3, retryDelay = 500, step, md5Holder } = opt
   return retryLoop(holder, async () => {
-    await uploadFileResumableOnce(holder, f, { step, md5Conn })
+    await uploadFileResumableOnce(holder, f, { step, md5Holder })
   }, {
     retry,
     retryDelay,
@@ -330,8 +330,9 @@ async function remoteUpload(remoteInfo, upload, opt = {}) {
     }
     // -- 进度开关: 仅未显式关闭且为 TTY 时启用
     const showProgress = opt.progress !== false && process.stdout.isTTY === true
-    // -- 跳过已上传: 建立一条 SSH 长连接用于逐文件查询 md5, 对比一个传一个, 避免预先全量对比的等待
-    const md5Conn = skipSame ? await openExecConn(remoteInfo).catch(() => null) : null
+    // -- 跳过已上传: 建立可重连的 md5 查询句柄(带重试), 逐文件即时对比, 避免预先全量对比的等待;
+    //    建立失败/中途断开会重试重连并告警, 不再静默降级为整批重传
+    const md5Holder = skipSame ? makeMd5Holder(remoteInfo, await openExecConnRetry(remoteInfo, {retry, retryDelay})) : null
 
     const failed = [] // -- 累计所有 upload 项中重试耗尽仍失败的文件
 
@@ -394,9 +395,9 @@ async function remoteUpload(remoteInfo, upload, opt = {}) {
           const currentFileSize = f.size
           // -- 即时对比这一个文件: 仅对不小于阈值的文件比对 md5(小文件直接传, 避免昂贵的 md5 计算)
           //    将走断点续传的大文件跳过整文件 md5: resume 自身用 stat+头部校验更快, 大小已满时再 md5 确认
-          if(skipSame && md5Conn && f.size >= skipSameMinSize && !(resume && f.size >= resumeMinSize)) {
-            const remoteMd5 = await remoteFileMd5(md5Conn, f.to)
-            if(remoteMd5 && (await localMd5(f.from).catch(() => ``)) === remoteMd5) {
+          if(skipSame && md5Holder && md5Holder.getConn() && f.size >= skipSameMinSize && !(resume && f.size >= resumeMinSize)) {
+            const {md5: remoteMd5, connOk} = await remoteFileMd5(md5Holder, f.to)
+            if(connOk && remoteMd5 && (await localMd5(f.from).catch(() => ``)) === remoteMd5) {
               skipped++
               globalDone += currentFileSize
               showProgress && redraw(globalDone, fileIdx + 1, path.basename(f.from))
@@ -415,7 +416,7 @@ async function remoteUpload(remoteInfo, upload, opt = {}) {
           // -- 大文件启用断点续传(resume 且达到阈值); 否则走 fastPut 重试
           const useResume = resume && f.size >= resumeMinSize
           const ok = await (useResume
-            ? uploadFileResumable(holder, f, { retry, retryDelay, step: showProgress ? onStep : undefined, md5Conn })
+            ? uploadFileResumable(holder, f, { retry, retryDelay, step: showProgress ? onStep : undefined, md5Holder })
             : uploadFileWithRetry(holder, f, { retry, retryDelay, step: showProgress ? onStep : undefined }))
           if(ok) {
             globalDone += currentFileSize
@@ -436,7 +437,7 @@ async function remoteUpload(remoteInfo, upload, opt = {}) {
       failed.forEach(f => console.log(`  - ${f.from} => ${f.to}`))
     }
     // -- 关闭 md5 查询长连接
-    md5Conn && md5Conn.end()
+    md5Holder && md5Holder.end()
     resolve()
   })
 }
@@ -446,11 +447,52 @@ async function remoteUpload(remoteInfo, upload, opt = {}) {
  * @param {*} remoteInfo 服务器信息
  * @returns {Promise<object>} ssh2 连接
  */
+// 连接工厂: 默认走 ssh2.Client; 测试可经 setSshFactory 注入假实现, 避免依赖真实服务器
+let _sshFactory = () => new Ssh()
+function setSshFactory(fn) { _sshFactory = typeof fn === `function` ? fn : (() => new Ssh()) }
+
 function openExecConn(remoteInfo) {
   return new Promise((resolve, reject) => {
-    const conn = new Ssh()
+    const conn = _sshFactory()
     conn.on(`ready`, () => resolve(conn)).on(`error`, reject).connect(remoteInfo)
   })
+}
+
+/**
+ * 带重试地建立 md5 查询连接: 失败按指数退避重试, 全部失败返回 null 并告警
+ * 避免 SSH 偶发握手失败 / 限流导致整批文件跳过对比静默失效(根因: 一次建立失败即放弃)
+ * @param {*} remoteInfo 服务器信息
+ * @param {object} opt { retry, retryDelay }
+ * @returns {Promise<object|null>} ssh2 连接; 全部失败时返回 null
+ */
+async function openExecConnRetry(remoteInfo, { retry = 2, retryDelay = 500 } = {}) {
+  for(let attempt = 0; attempt <= retry; attempt++) {
+    const conn = await openExecConn(remoteInfo).catch(() => null)
+    if(conn) return conn
+    if(attempt < retry) await sleep(Math.min(retryDelay * Math.pow(2, attempt), 10000))
+  }
+  console.log(`skipSame: md5 查询连接建立失败(已重试 ${retry + 1} 次), 本次将不跳过已上传文件`)
+  return null
+}
+
+/**
+ * md5 查询的可重连句柄: 复用与上传一致的 holder 模式(DRY)
+ * 长连接中途断开时, remoteFileMd5 经 reconnect 重建后再比对, 而非静默降级为重传
+ * @param {*} remoteInfo 服务器信息
+ * @param {object|null} initialConn 初始连接(openExecConnRetry 结果, 可为 null)
+ * @returns {{getConn:()=>object|null, reconnect:()=>Promise<object|null>, end:()=>void}}
+ */
+function makeMd5Holder(remoteInfo, initialConn) {
+  let conn = initialConn
+  return {
+    getConn: () => conn,
+    reconnect: async () => {
+      try { conn && conn.end() } catch(e) {}
+      conn = await openExecConn(remoteInfo).catch(() => null)
+      return conn
+    },
+    end: () => { try { conn && conn.end() } catch(e) {} },
+  }
 }
 
 /**
@@ -467,6 +509,7 @@ function execOnConn(conn, cmd) {
       stream.on(`data`, d => out += d.toString())
       stream.stderr.on(`data`, () => {})
       stream.on(`close`, () => resolve(out))
+      stream.on(`error`, reject) // -- 流级错误视同连接问题, 触发上层重连
     })
   })
 }
@@ -477,10 +520,30 @@ function execOnConn(conn, cmd) {
  * @param {string} remotePath 远程文件路径
  * @returns {Promise<string>}
  */
-async function remoteFileMd5(conn, remotePath) {
-  const out = await execOnConn(conn, `md5sum "${remotePath}" 2>/dev/null`).catch(() => ``)
-  const m = String(out).match(/([0-9a-fA-F]{32})/)
-  return m ? m[1].toLowerCase() : ``
+/**
+ * 查询单个远程文件的 md5, 连接异常时自动重连重试一次
+ * 区分两种"无 md5": exec 抛错=连接问题(重连重试); resolve 无匹配=文件不存在(正常, 不重连)
+ * @param {object} holder makeMd5Holder 句柄
+ * @param {string} remotePath 远程文件路径
+ * @returns {Promise<{md5:string, connOk:boolean}>} md5 小写摘要(无则空串); connOk 连接是否正常
+ */
+async function remoteFileMd5(holder, remotePath) {
+  const tryOnce = async () => {
+    const conn = holder.getConn()
+    if(!conn) return {md5: ``, connOk: false}
+    // -- exec 抛错(null)标记为连接级问题, 与"成功但无输出(空串)"区分
+    const out = await execOnConn(conn, `md5sum "${remotePath}" 2>/dev/null`).catch(() => null)
+    if(out === null) return {md5: ``, connOk: false}
+    const m = String(out).match(/([0-9a-fA-F]{32})/)
+    return {md5: m ? m[1].toLowerCase() : ``, connOk: true}
+  }
+  let res = await tryOnce()
+  if(!res.connOk) {
+    // -- 连接级失败: 重连后再查一次, 而非静默放弃该文件
+    const reconnected = await holder.reconnect()
+    if(reconnected) res = await tryOnce()
+  }
+  return res
 }
 
 /**
@@ -713,4 +776,8 @@ module.exports = {
   uploadFileWithRetry,
   uploadFileResumable,
   expandGlobby,
+  openExecConnRetry,
+  makeMd5Holder,
+  remoteFileMd5,
+  setSshFactory,
 }
