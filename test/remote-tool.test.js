@@ -167,4 +167,70 @@ describe('remote-tool 集成测试', () => {
       fs.rmSync(tmpRoot, { recursive: true, force: true })
     }
   })
+
+  it('atomic-rename: 上传覆盖已存在目标, 内容原子切换且无 .part 残留', async () => {
+    // 验证 atomicRename(.part 临时文件 -> 原子改名)在真实服务器的可观测契约
+    const target = `${DIST}/rt-atomic.json`
+    // 前置: 远程目标先放旧内容(与本地 srcPkg 不同), 使覆盖场景确定触发
+    await run(`rm -f "${target}"; mkdir -p "${DIST}"; echo rt-old-content > "${target}"`)
+
+    await remoteTool(server, {
+      upload: [[srcPkg, target]],
+    }, { log: false, progress: false })
+
+    // 验证: 目标被原子覆盖为本地新内容(非追加/损坏)
+    expect(await remoteMd5(target)).toBe(localMd5(srcPkg))
+    // 验证: 临时文件已原子改名切走, 同目录无 .part 残留
+    const list = await remoteList(DIST)
+    expect(list.some(n => n === `rt-atomic.json.part`)).toBe(false)
+  })
+
+  it('skip-same: 相同大文件二次上传, 远程内容仍一致(回归保护)', async () => {
+    // 构造 >= skipSameMinSize(24KB) 的临时文件, 验证 skipSame 开启下二次上传不损坏数据
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rt-skip-same-'))
+    const bigFile = path.join(tmpRoot, 'big.bin')
+    fs.writeFileSync(bigFile, Buffer.alloc(25000, 7)) // 25000B > 24576B(24KB)
+    const target = `${DIST}/rt-skip-same.bin`
+    try {
+      await run(`rm -f "${target}"`)
+      // 第一次上传: 远程不存在 => 正常上传
+      await remoteTool(server, {
+        upload: [[bigFile, target]],
+      }, { log: false, progress: false })
+      expect(await remoteMd5(target)).toBe(localMd5(bigFile))
+      // 第二次上传同一文件: skipSame 应命中, 不重传不损坏
+      await remoteTool(server, {
+        upload: [[bigFile, target]],
+      }, { log: false, progress: false })
+      expect(await remoteMd5(target)).toBe(localMd5(bigFile))
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('skip-same: 同名同大小异内容 => 触发重传(md5 比对, 不凭大小误跳过)', async () => {
+    // 验证 skipSame 凭 md5(非仅大小)比对: 远程同大小异内容 => 应重传覆盖
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rt-skip-diff-'))
+    const fileA = path.join(tmpRoot, 'a.bin')
+    const fileB = path.join(tmpRoot, 'b.bin')
+    fs.writeFileSync(fileA, Buffer.alloc(25000, 7)) // 同大小, 内容 0x07
+    fs.writeFileSync(fileB, Buffer.alloc(25000, 8)) // 同大小, 内容 0x08
+    const target = `${DIST}/rt-skip-diff.bin`
+    try {
+      await run(`rm -f "${target}"`)
+      // 前置: 先上传 fileB 作为远程"旧内容"(与 fileA 同大小异内容)
+      await remoteTool(server, {
+        upload: [[fileB, target]],
+      }, { log: false, progress: false })
+      expect(await remoteMd5(target)).toBe(localMd5(fileB))
+      // 再上传 fileA: 大小相同但 md5 不同 => 应重传覆盖
+      await remoteTool(server, {
+        upload: [[fileA, target]],
+      }, { log: false, progress: false })
+      // 验证: 被覆盖为 fileA(若凭大小误跳过, target 仍是 fileB => md5 不匹配, 测试失败)
+      expect(await remoteMd5(target)).toBe(localMd5(fileA))
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true })
+    }
+  })
 })
