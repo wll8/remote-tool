@@ -152,6 +152,42 @@ function renderProgress({current, total, startMs, fileIdx, fileCount, currentNam
 }
 
 /**
+ * 原子地把 src 重命名为 dst, 保证目标文件在上传期间始终是完整版本:
+ * 优先用 posix-rename@openssh.com(同文件系统上原子覆盖已存在的目标);
+ * 服务器不支持该扩展时回退为 stat+unlink+rename(窗口期 dst 短暂缺失, 非完全原子,
+ * 仅极少数旧服务器触发)。临时文件与目标在同一目录 => 必然同一文件系统, 满足原子前提。
+ * @param {object} sftp ssh2 SFTP 句柄(client.sftpWrapper)
+ * @param {string} src 临时文件路径
+ * @param {string} dst 最终目标路径
+ * @returns {Promise<void>}
+ */
+function atomicRename(sftp, src, dst) {
+  // dst 不存在直接 rename; 存在则先删除(普通 SSH_FXP_RENAME 不覆盖已存在目标)
+  const fallback = () => new Promise((resolve, reject) => {
+    const doRename = () => sftp.rename(src, dst, (e) => e ? reject(e) : resolve())
+    sftp.stat(dst, (eStat) => eStat ? doRename() : sftp.unlink(dst, (eUnlink) => eUnlink ? reject(eUnlink) : doRename()))
+  })
+  return new Promise((resolve, reject) => {
+    try {
+      // ext_openssh_rename 不支持时同步抛错, 需 try/catch 回退
+      sftp.ext_openssh_rename(src, dst, (err) => err ? fallback().then(resolve, reject) : resolve())
+    } catch(e) {
+      fallback().then(resolve, reject)
+    }
+  })
+}
+
+/**
+ * 尽力删除远程文件, 忽略错误(不存在等), 仅用于清理临时残留
+ * @param {object} sftp ssh2 SFTP 句柄
+ * @param {string} p 远程路径
+ * @returns {Promise<void>}
+ */
+function safeUnlink(sftp, p) {
+  return new Promise(resolve => { sftp.unlink(p, () => resolve()) })
+}
+
+/**
  * 上传单个文件, 失败时按指数退避自动重试; 连接级错误通过 holder.reconnect 重建客户端
  * @param {object} holder  { getClient: () => client, reconnect: async () => {} }
  * @param {{from:string, to:string, size:number}} f 文件描述
@@ -163,9 +199,14 @@ function renderProgress({current, total, startMs, fileIdx, fileCount, currentNam
  */
 async function uploadFileWithRetry(holder, f, opt = {}) {
   const { retry = 3, retryDelay = 500, step } = opt
+  // -- 临时文件: 写满后原子改名到目标, 保证上传期间目标始终是完整版本
+  const tmpTo = `${f.to}.part`
   for (let attempt = 0; attempt <= retry; attempt++) {
+    const client = holder.getClient()
     try {
-      await holder.getClient().uploadFile(f.from, f.to, step ? { step } : {})
+      // -- 先写临时文件, 完成后原子改名, 避免上传中途目标处于残缺状态
+      await client.uploadFile(f.from, tmpTo, step ? { step } : {})
+      await atomicRename(client.sftpWrapper, tmpTo, f.to)
       return true
     } catch (err) {
       if (attempt < retry) {
@@ -179,6 +220,8 @@ async function uploadFileWithRetry(holder, f, opt = {}) {
         continue
       }
       console.log(`upload failed after ${retry + 1} attempts: ${f.from} => ${f.to}`, err)
+      // -- 重试耗尽: 清理残留的临时文件(改名前失败才会留下)
+      await safeUnlink(holder.getClient().sftpWrapper, tmpTo)
       return false
     }
   }
@@ -254,38 +297,46 @@ async function uploadFileResumableOnce(holder, f, { step, md5Holder } = {}) {
   const client = holder.getClient()
   const sftp = client.sftpWrapper
   const fileSize = f.size
-  // -- 远程已存在字节(不存在/失败则 0)
-  const st = await client.stat(f.to).catch(() => null)
-  let remoteSize = st && st.size ? st.size : 0
-  if(remoteSize >= fileSize) {
-    // -- 大小已满: md5 确认是否真一致(防同名同大小异内容), 不一致则重传
+  // -- 断点续传的持久中间文件: 写满后原子改名到目标, 保证目标始终完整(旧版或新版)
+  const tmpTo = `${f.to}.part`
+  // -- 1) 目标 f.to 已达完整大小: 有 md5 句柄则校验内容, 一致(或无句柄)即跳过, 保留 skipSame 能力
+  const stTo = await client.stat(f.to).catch(() => null)
+  if(stTo && stTo.size >= fileSize) {
+    let same = true // 默认视为一致(无 md5 句柄时凭大小跳过, 与原行为一致)
     if(md5Holder && md5Holder.getConn()) {
       const {md5: rm} = await remoteFileMd5(md5Holder, f.to)
       const lm = await localMd5(f.from).catch(() => ``)
-      if(rm && lm && rm !== lm) remoteSize = 0
+      if(rm && lm && rm !== lm) same = false // 同名同大小异内容: 需重传
     }
-  } else if(remoteSize > 0) {
-    // -- 部分存在: 头部 md5 校验是否本次断点, 否则首传覆盖
-    if(!await isOwnBreakpoint(sftp, f, remoteSize)) remoteSize = 0
+    if(same) return // 完整且一致 -> 跳过, f.to 无需改动
   }
-  // -- 已传满(且 md5 一致)则跳过写入
-  if(remoteSize >= fileSize) return
-  const flags = remoteSize > 0 ? `r+` : `w` // r+: 不截断, 从 start 续写; w: 覆盖创建
-  const ws = sftp.createWriteStream(f.to, { start: remoteSize, flags })
-  const rs = fs.createReadStream(f.from, { start: remoteSize })
-  let sent = 0
-  if(step) {
-    rs.on(`data`, chunk => {
-      sent += chunk.length
-      step(remoteSize + sent)
+  // -- 2) 以 .part 为断点: stat .part 决定续写位置(不存在/非本次产物则从头)
+  const st = await client.stat(tmpTo).catch(() => null)
+  let remoteSize = st && st.size ? st.size : 0
+  if(remoteSize > 0 && !await isOwnBreakpoint(sftp, {...f, to: tmpTo}, remoteSize)) {
+    remoteSize = 0 // 头部 md5 不匹配: 非本次中断产物, 从头覆盖写
+  }
+  // -- 3) 写 .part(remoteSize < fileSize 时); r+: 不截断续写, w: 覆盖创建
+  if(remoteSize < fileSize) {
+    const flags = remoteSize > 0 ? `r+` : `w`
+    const ws = sftp.createWriteStream(tmpTo, { start: remoteSize, flags })
+    const rs = fs.createReadStream(f.from, { start: remoteSize })
+    let sent = 0
+    if(step) {
+      rs.on(`data`, chunk => {
+        sent += chunk.length
+        step(remoteSize + sent)
+      })
+    }
+    await new Promise((resolve, reject) => {
+      ws.on(`finish`, resolve)
+      ws.on(`error`, reject)
+      rs.on(`error`, reject)
+      rs.pipe(ws)
     })
   }
-  await new Promise((resolve, reject) => {
-    ws.on(`finish`, resolve)
-    ws.on(`error`, reject)
-    rs.on(`error`, reject)
-    rs.pipe(ws)
-  })
+  // -- 4) 原子改名 .part -> f.to, 此时目标才切换为新版(此前始终是旧版完整文件)
+  await atomicRename(sftp, tmpTo, f.to)
 }
 
 /**
@@ -303,7 +354,11 @@ async function uploadFileResumable(holder, f, opt = {}) {
   }, {
     retry,
     retryDelay,
-    onFail: (err) => console.log(`resume upload failed after ${retry + 1} attempts: ${f.from} => ${f.to}`, err),
+    onFail: (err) => {
+      console.log(`resume upload failed after ${retry + 1} attempts: ${f.from} => ${f.to}`, err)
+      // 重试耗尽: 清理残留的断点临时文件(改名前失败才会留下), 与普通上传失败清理一致
+      safeUnlink(holder.getClient().sftpWrapper, `${f.to}.part`)
+    },
   })
 }
 
@@ -775,6 +830,7 @@ module.exports = {
   isConnectionError,
   uploadFileWithRetry,
   uploadFileResumable,
+  atomicRename,
   expandGlobby,
   openExecConnRetry,
   makeMd5Holder,
